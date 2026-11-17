@@ -1,0 +1,9 @@
+# Python >= 3.10 (tested with Python 3.12)
+# minimum versions; the versions in brackets are the ones the code was tested with
+numpy>=1.24,<2.0      # [1.26.4]
+scipy>=1.10           # [1.13.1]
+scikit-learn>=1.3     # [1.6.1]
+torch>=2.0            # [2.x, CPU and CUDA]
+pandas>=2.0           # [2.2.3]  reads pems-bay.h5
+tables>=3.8           # [3.10.1] HDF5 backend of pandas
+pytest>=7             # [8.3.5]  tests only

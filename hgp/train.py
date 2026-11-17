@@ -1,0 +1,161 @@
+"""Training and test evaluation of the proposed model."""
+
+import csv
+import json
+import math
+import time
+from dataclasses import asdict
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from .config import DataConfig, TrainConfig
+from .data import Data, Windows
+from .graphs.build import row_normalise, to_sparse
+from .metrics import horizon_metrics, masked_mae
+from .model import HICP, count_parameters
+
+
+def seed_everything(seed: int) -> None:
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+class Trainer:
+    def __init__(self, data: Data, data_config: DataConfig, config: TrainConfig, graphs: dict,
+                 device: torch.device = None, max_windows: int = None):
+        """graphs: the Part A graph G_h of every horizon h (hgp.graphs.load_graphs)."""
+        self.data, self.dc, self.config = data, data_config, config
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        seed_everything(config.seed)
+        self.graph_summary = {h: {"edges": int((g > 0).sum()), "sources_per_target": float((g > 0).sum(1).mean())}
+                              for h, g in graphs.items()}
+        self.graphs = {h: to_sparse(row_normalise(g), self.device) for h, g in graphs.items()}
+        road = (data.road != 0).astype(np.float32)                 # physical branch: road links, no self-loops, row-normalised
+        np.fill_diagonal(road, 0.0)
+        self.physical = to_sparse(row_normalise(road), self.device)
+        self.model = HICP(5, data_config.horizons, config.model, data.num_nodes).to(self.device)
+        self.loaders = {}
+        for split in (data.train, data.val, data.test):
+            ds = Windows(split, data_config.seq_len, data_config.horizons)
+            if max_windows:
+                ds = Windows(split, data_config.seq_len, data_config.horizons, ds.starts[:max_windows])
+            self.loaders[split.name] = DataLoader(ds, config.batch_size, shuffle=split.name == "train",
+                                                  collate_fn=Windows.collate, generator=torch.Generator().manual_seed(config.seed))
+        self.run_dir = config.run_dir()
+        (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+
+    def _schedule(self, optimizer):
+        """One warm-up epoch, then cosine decay to zero over the remaining epochs."""
+        steps = len(self.loaders["train"])
+        total, warm = self.config.epochs * steps, max(1, self.config.warmup_epochs * steps)
+
+        def factor(step):
+            if step < warm:
+                return (step + 1) / warm
+            return 0.5 * (1 + math.cos(math.pi * min(1.0, (step - warm) / max(1, total - warm))))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+    def train_epoch(self, optimizer, scheduler) -> float:
+        self.model.train()
+        total = count = 0
+        for flow, tf, y, m, _ in self.loaders["train"]:
+            flow, tf, y, m = (t.to(self.device) for t in (flow, tf, y, m))
+            pred, _ = self.model(flow, tf, self.graphs, self.physical)
+            loss = masked_mae(pred, y, m)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            optimizer.step()
+            scheduler.step()
+            total += loss.item() * len(flow)
+            count += len(flow)
+        return total / count
+
+    @torch.no_grad()
+    def predict(self, name: str):
+        """Per horizon: targets and predictions in mph (observed targets only), window starts, mean gate weight per branch."""
+        self.model.eval()
+        H = self.dc.horizons
+        targets, preds, starts = ({h: [] for h in H} for _ in range(3))
+        gate = {h: {b: 0.0 for b in self.model.branches} for h in H}
+        mean, std = (torch.as_tensor(v, device=self.device) for v in (self.data.mean, self.data.std))
+        n = 0
+        for flow, tf, y, m, s in self.loaders[name]:
+            flow, tf, y = (t.to(self.device) for t in (flow, tf, y))
+            pred, g = self.model(flow, tf, self.graphs, self.physical)
+            pred, y = pred * std + mean, y * std + mean
+            for k, h in enumerate(H):
+                keep = m[:, k].numpy()
+                if keep.any():
+                    preds[h].append(pred[keep, k].cpu().numpy())
+                    targets[h].append(y[keep, k].cpu().numpy())
+                    starts[h].append(s.numpy()[keep])
+                for b, v in g[h].items():
+                    gate[h][b] += float(v) * len(flow)
+            n += len(flow)
+        cat = lambda d: {h: np.concatenate(v) if v else np.zeros((0, self.data.num_nodes)) for h, v in d.items()}
+        return cat(targets), cat(preds), cat(starts), {h: {b: v / max(n, 1) for b, v in g.items()} for h, g in gate.items()}
+
+    def fit(self) -> dict:
+        cfg = self.config
+        optimizer = torch.optim.AdamW(self.model.parameters(), cfg.learning_rate, weight_decay=cfg.weight_decay)
+        scheduler = self._schedule(optimizer)
+        best, bad, t0 = {"epoch": 0, "mae": float("inf")}, 0, time.time()
+        self._json("config.json", {"train": asdict(cfg), "data": asdict(self.dc), "graphs": self.graph_summary,
+                                   "parameters": count_parameters(self.model), "device": str(self.device)})
+        with open(self.run_dir / "history.csv", "w", newline="") as f:
+            writer = None
+            for epoch in range(1, cfg.epochs + 1):
+                t1 = time.time()
+                train_loss = self.train_epoch(optimizer, scheduler)
+                targets, preds, _, gate = self.predict("val")
+                val = horizon_metrics(targets, preds, self.dc.mape_min_flow)
+                row = {"epoch": epoch, "train_loss": train_loss, "val_mae": val["mean"]["mae"], "val_rmse": val["mean"]["rmse"],
+                       **{f"val_mae_h{h}": val[h]["mae"] for h in self.dc.horizons},
+                       **{f"gate_{b}_h{h}": gate[h][b] for b in self.model.branches for h in self.dc.horizons},
+                       "lr": optimizer.param_groups[0]["lr"], "seconds": time.time() - t1}
+                writer = writer or csv.DictWriter(f, fieldnames=list(row))
+                if epoch == 1:
+                    writer.writeheader()
+                writer.writerow(row)
+                f.flush()
+                improved = val["mean"]["mae"] < best["mae"]
+                if improved:
+                    best, bad = {"epoch": epoch, "mae": val["mean"]["mae"], "val": val, "gate": gate}, 0
+                    torch.save(self.model.state_dict(), self.run_dir / "checkpoints" / "best.pt")
+                else:
+                    bad += 1
+                shown = " ".join("/".join(f"{gate[h][b]:.2f}" for b in self.model.branches) for h in self.dc.horizons)
+                print(f"epoch {epoch:3d}  loss {train_loss:.4f}  val MAE {val['mean']['mae']:.3f}  "
+                      f"gate {shown}  {row['seconds']:.0f}s{'  *' if improved else ''}", flush=True)
+                if bad >= cfg.patience:
+                    break
+
+        self.model.load_state_dict(torch.load(self.run_dir / "checkpoints" / "best.pt", map_location=self.device, weights_only=True))
+        targets, preds, starts, gate = self.predict("test")
+        test = horizon_metrics(targets, preds, self.dc.mape_min_flow)
+        self._save_predictions(targets, preds, starts)
+        results = {"run": self.run_dir.name, "parameters": count_parameters(self.model), "best_epoch": best["epoch"],
+                   "epochs": epoch, "validation": best["val"], "test": test, "branches": list(self.model.branches),
+                   "test_gate": gate, "training_seconds": time.time() - t0, "device": str(self.device)}
+        self._json("results.json", results)
+        print("test  " + "  ".join(f"h{h}: MAE {test[h]['mae']:.3f} RMSE {test[h]['rmse']:.3f} MAPE {test[h]['mape']:.2f}%"
+                                   for h in self.dc.horizons))
+        return results
+
+    def _save_predictions(self, targets, preds, starts) -> None:
+        split, T = self.data.test, self.dc.seq_len
+        for h in self.dc.horizons:
+            rows = starts[h] + T + h - 1
+            np.savez_compressed(self.run_dir / f"test_predictions_h{h}.npz", targets=targets[h].astype(np.float32),
+                                predictions=preds[h].astype(np.float32), rows=(split.offset + rows).astype(np.int64),
+                                timestamps=split.timestamps[rows], sensors=self.data.sensors)
+
+    def _json(self, name: str, obj) -> None:
+        (self.run_dir / name).write_text(json.dumps(obj, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
